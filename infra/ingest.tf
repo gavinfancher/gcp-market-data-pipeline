@@ -51,3 +51,120 @@ resource "google_secret_manager_secret_iam_member" "ingest_alpaca" {
   role      = "roles/secretmanager.secretAccessor"
   member    = google_service_account.ingest.member
 }
+
+# ---------------------------------------------------------------------------
+# Artifact Registry — where the ingest container image lives
+# ---------------------------------------------------------------------------
+
+resource "google_artifact_registry_repository" "images" {
+  repository_id = "images"
+  location      = var.region
+  format        = "DOCKER"
+
+  # Every build pushes a new image; without cleanup they pile up (and cost).
+  # "keep" policies win over "delete", so: delete anything older than 30 days,
+  # except the 5 most recent versions.
+  cleanup_policy_dry_run = false
+
+  cleanup_policies {
+    id     = "delete-old"
+    action = "DELETE"
+    condition {
+      older_than = "${30 * 24 * 60 * 60}s"
+    }
+  }
+
+  cleanup_policies {
+    id     = "keep-recent"
+    action = "KEEP"
+    most_recent_versions {
+      keep_count = 5
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# ---------------------------------------------------------------------------
+# Cloud Run Job
+# ---------------------------------------------------------------------------
+# Run it (defaults to yesterday):
+#   gcloud run jobs execute equity-ingest --region us-central1
+# Backfill a range — env overrides apply to that one execution only:
+#   gcloud run jobs execute equity-ingest --region us-central1 \
+#     --update-env-vars START_DATE=2026-01-01,END_DATE=2026-06-30
+
+resource "google_cloud_run_v2_job" "ingest" {
+  name     = "equity-ingest"
+  location = var.region
+
+  # The provider defaults this to true, which blocks `terraform destroy`.
+  deletion_protection = false
+
+  template {
+    task_count = 1
+
+    template {
+      service_account = google_service_account.ingest.email
+      timeout         = "600s"
+      max_retries     = 1 # safe: main.py skips days already in GCS
+
+      containers {
+        # Placeholder so the job can exist before our first build. The real
+        # image is deployed with `gcloud run jobs update --image` (see
+        # lifecycle below), by hand now and from CI later.
+        image = "us-docker.pkg.dev/cloudrun/container/job:latest"
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "1Gi"
+          }
+        }
+
+        env {
+          name  = "DEST_BUCKET"
+          value = google_storage_bucket.landing.name
+        }
+
+        env {
+          name = "ALPACA_API_KEY_ID"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.alpaca["alpaca-api-key-id"].secret_id
+              version = "latest"
+            }
+          }
+        }
+
+        env {
+          name = "ALPACA_API_SECRET_KEY"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.alpaca["alpaca-api-secret-key"].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  lifecycle {
+    # Terraform owns the job's config; deploys own which image runs.
+    # Without this, every `terraform apply` would roll back to the placeholder.
+    # client/client_version get stamped by gcloud on each update.
+    ignore_changes = [
+      template[0].template[0].containers[0].image,
+      client,
+      client_version,
+    ]
+  }
+
+  # The job reads secrets as sa-ingest, so the grants must exist first.
+  # Nothing in this block references the IAM resources, so say it explicitly.
+  depends_on = [
+    google_secret_manager_secret_iam_member.ingest_alpaca,
+    google_storage_bucket_iam_member.ingest_landing,
+  ]
+}
