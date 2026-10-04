@@ -8,7 +8,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 ENV PATH="/app/.venv/bin:$PATH"
 
-COPY main.py ./
+COPY *.py ./
 
 # Don't run as root inside the container.
 RUN useradd --uid 10001 app

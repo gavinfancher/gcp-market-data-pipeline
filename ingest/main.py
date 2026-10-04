@@ -1,17 +1,28 @@
 """
-Cloud Run Job: copy Massive minute-aggregate flat files (S3) into GCS.
+Cloud Run Job: Alpaca 1-minute bars → GCS, one gzipped CSV per trading day.
 
-Work is derived from dates, not a manifest:
-  - START_DATE / END_DATE (YYYY-MM-DD, inclusive). Both default to yesterday (New York time).
-  - Cloud Run sets CLOUD_RUN_TASK_INDEX / CLOUD_RUN_TASK_COUNT. Task i copies every
-    date where day_number % TASK_COUNT == i, so `--tasks 20` splits a backfill 20 ways.
+    gs://$DEST_BUCKET/landing/alpaca/minute_bars/date=YYYY-MM-DD/bars.csv.gz
 
-Idempotent: files already in GCS are skipped. Weekends/holidays have no source file
-and are skipped too.
+Configuration (all env vars):
+  ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY   from Secret Manager
+  DEST_BUCKET                                  landing bucket
+  START_DATE / END_DATE                        YYYY-MM-DD inclusive; default yesterday (New York)
+  SYMBOLS                                      comma-separated; default below
+  FEED                                         sip (default) or iex
+  RATE_LIMIT_RPM                               account-wide budget; default 180 (hard cap 200)
+  WORKERS                                      days fetched in parallel per task; default 4
+  OVERWRITE                                    "true" to re-fetch days already in GCS
+
+Parallelism: Cloud Run sets CLOUD_RUN_TASK_INDEX / CLOUD_RUN_TASK_COUNT. Task i takes
+every TASK_COUNT-th trading day. Alpaca's rate limit is per *account*, so each task
+gets RATE_LIMIT_RPM / TASK_COUNT — more tasks won't beat the API quota.
 """
 
 from __future__ import annotations
 
+import csv
+import gzip
+import io
 import json
 import logging
 import os
@@ -21,13 +32,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import boto3
-from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError
 from google.cloud import storage
 
-SOURCE_BUCKET = "flatfiles"
-DATASET_PREFIX = "us_stocks_sip/minute_aggs_v1"
+from alpaca import COLUMNS, AlpacaClient
+from ratelimit import RateLimiter
+
+MARKET_TZ = ZoneInfo("America/New_York")
+DEST_PREFIX = "landing/alpaca/minute_bars"
+DEFAULT_SYMBOLS = "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,JPM,V,JNJ"
 
 
 class JsonFormatter(logging.Formatter):
@@ -48,67 +60,66 @@ def env_date(name: str, default: date) -> date:
     return date.fromisoformat(value) if value else default
 
 
-def dates_for_task(start: date, end: date, task_index: int, task_count: int) -> list[date]:
-    days = (end - start).days + 1
-    return [
-        start + timedelta(days=n)
-        for n in range(days)
-        if n % task_count == task_index and (start + timedelta(days=n)).weekday() < 5
-    ]
+def blob_path(day: date) -> str:
+    return f"{DEST_PREFIX}/date={day.isoformat()}/bars.csv.gz"
 
 
-def source_key(day: date) -> str:
-    return f"{DATASET_PREFIX}/{day:%Y}/{day:%m}/{day.isoformat()}.csv.gz"
+def to_csv_gz(rows: list[tuple]) -> bytes:
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz, io.TextIOWrapper(gz, newline="") as text:
+        writer = csv.writer(text)
+        writer.writerow(COLUMNS)
+        writer.writerows(rows)
+    return buf.getvalue()
 
 
-def copy_day(s3, bucket: storage.Bucket, dest_prefix: str, day: date) -> str:
-    key = source_key(day)
-    blob = bucket.blob(f"{dest_prefix}/{key}")
-    if blob.exists():
+def ingest_day(client: AlpacaClient, bucket: storage.Bucket, day: date, symbols: list[str], overwrite: bool) -> str:
+    blob = bucket.blob(blob_path(day))
+    if not overwrite and blob.exists():
         return "exists"
-    try:
-        obj = s3.get_object(Bucket=SOURCE_BUCKET, Key=key)
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
-            return "missing"  # market holiday, or not published yet
-        raise
-    blob.upload_from_file(obj["Body"], size=obj["ContentLength"], content_type="application/gzip")
-    return "copied"
+    # Whole calendar day in New York time, so pre/post-market bars are included.
+    start = datetime(day.year, day.month, day.day, tzinfo=MARKET_TZ)
+    rows = client.get_bars(symbols, start.isoformat(), (start + timedelta(days=1)).isoformat())
+    if not rows:
+        return "empty"
+    blob.upload_from_string(to_csv_gz(rows), content_type="application/gzip")
+    log.info(f"{day} wrote {len(rows)} rows")
+    return "written"
 
 
 def main() -> int:
-    yesterday = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=1)
+    yesterday = datetime.now(MARKET_TZ).date() - timedelta(days=1)
     start = env_date("START_DATE", yesterday)
     end = env_date("END_DATE", yesterday)
+    symbols = [s.strip().upper() for s in os.environ.get("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
+    feed = os.environ.get("FEED", "sip")
+    workers = int(os.environ.get("WORKERS", "4"))
+    overwrite = os.environ.get("OVERWRITE", "").lower() == "true"
     task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
     task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
-    workers = int(os.environ.get("WORKERS", "8"))
-    dest_bucket = os.environ["DEST_BUCKET"]
-    dest_prefix = os.environ.get("DEST_PREFIX", "landing").strip("/")
+    rpm = float(os.environ.get("RATE_LIMIT_RPM", "180")) / task_count
 
-    days = dates_for_task(start, end, task_index, task_count)
-    log.info(f"task {task_index}/{task_count}: {len(days)} weekdays in {start}..{end}")
+    bucket = storage.Client().bucket(os.environ["DEST_BUCKET"])
+    limiter = RateLimiter(rate_per_min=rpm)
 
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=os.environ.get("S3_ENDPOINT", "https://files.massive.com"),
-        aws_access_key_id=os.environ["MASSIVE_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["MASSIVE_SECRET_KEY"],
-        config=BotoConfig(signature_version="s3v4", retries={"max_attempts": 5, "mode": "standard"}),
-    )
-    bucket = storage.Client().bucket(dest_bucket)
+    with AlpacaClient(
+        os.environ["ALPACA_API_KEY_ID"], os.environ["ALPACA_API_SECRET_KEY"], limiter, feed=feed
+    ) as client:
+        days = client.trading_days(start, end)[task_index::task_count]
+        log.info(
+            f"task {task_index}/{task_count}: {len(days)} trading days in {start}..{end}, "
+            f"{len(symbols)} symbols, feed={feed}, {rpm:.0f} rpm"
+        )
 
-    def run(day: date) -> str:
-        try:
-            result = copy_day(s3, bucket, dest_prefix, day)
-            log.info(f"{day} {result}")
-        except Exception as exc:
-            result = "failed"
-            log.error(f"{day} failed: {exc}")
-        return result
+        def run(day: date) -> str:
+            try:
+                return ingest_day(client, bucket, day, symbols, overwrite)
+            except Exception as exc:
+                log.error(f"{day} failed: {exc}")
+                return "failed"
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        counts = Counter(pool.map(run, days))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            counts = Counter(pool.map(run, days))
 
     log.info(f"task {task_index} done: {dict(counts)}")
     return 1 if counts["failed"] else 0
