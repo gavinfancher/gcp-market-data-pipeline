@@ -1,11 +1,15 @@
-sa-key.json
-*-key.json
-**/finpipe-iceberg-reader.json
 .DS_Store
 __pycache__/
 *.pyc
 .venv/
-massive.env
-gcloud-config.env
-ref/config.env
-.tmp_dagster_home*/
+.env
+
+# Never commit credentials
+*-key.json
+
+# Terraform: provider cache, state (contains resource details), and your real values.
+# DO commit .terraform.lock.hcl.
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
