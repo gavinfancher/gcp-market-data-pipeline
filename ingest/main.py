@@ -52,6 +52,7 @@ class JsonFormatter(logging.Formatter):
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(JsonFormatter())
 logging.basicConfig(level=logging.INFO, handlers=[handler])
+logging.getLogger("httpx").setLevel(logging.WARNING)  # it logs every request at INFO
 log = logging.getLogger("ingest")
 
 
