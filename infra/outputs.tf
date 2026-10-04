@@ -14,3 +14,7 @@ output "image_repo" {
 output "ingest_job" {
   value = google_cloud_run_v2_job.ingest.name
 }
+
+output "bars_table" {
+  value = "${var.project_id}.${google_bigquery_dataset.market_data.dataset_id}.${google_bigquery_table.minute_bars.table_id}"
+}
