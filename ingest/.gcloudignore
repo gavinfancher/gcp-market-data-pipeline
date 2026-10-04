@@ -1,0 +1,7 @@
+# Files `gcloud builds submit` should NOT upload as build context.
+# (gcloud only reads a .gitignore in this folder, not the repo root's.)
+.gcloudignore
+.venv/
+__pycache__/
+*.pyc
+.python-version
