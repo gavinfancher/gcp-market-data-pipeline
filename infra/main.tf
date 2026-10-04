@@ -11,6 +11,7 @@ resource "google_project_service" "apis" {
     "artifactregistry.googleapis.com",
     "bigquery.googleapis.com",
     "cloudbuild.googleapis.com",
+    "cloudscheduler.googleapis.com",
     "iam.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",
