@@ -12,8 +12,10 @@ terraform {
     }
   }
 
-  # State starts out local (terraform.tfstate in this folder). In a later step
-  # we move it to a GCS bucket with `terraform init -migrate-state`.
+  # State is local (terraform.tfstate in this folder, git-ignored) on purpose:
+  # this is a one-person project and Terraform only runs from a laptop. With a
+  # team or CI running Terraform, you'd add a `backend "gcs"` block here for
+  # shared state + locking.
 }
 
 provider "google" {
@@ -22,7 +24,7 @@ provider "google" {
 
   # Every resource that supports labels gets these, for cost reports and filtering.
   default_labels = {
-    app        = "equity-lakehouse"
+    app        = "gcp-market-data-pipeline"
     managed-by = "terraform"
   }
 }

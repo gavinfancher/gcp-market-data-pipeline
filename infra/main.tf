@@ -1,11 +1,15 @@
 # ---------------------------------------------------------------------------
 # APIs
 # ---------------------------------------------------------------------------
+# Terraform loads every .tf file in this folder as one config — the split
+# into main.tf / storage.tf / ingest.tf is just for humans.
 
 # for_each creates one resource per item. Each is tracked in state under its
 # key, e.g. google_project_service.apis["run.googleapis.com"].
 resource "google_project_service" "apis" {
   for_each = toset([
+    "iam.googleapis.com",
+    "secretmanager.googleapis.com",
     "storage.googleapis.com",
   ])
 
@@ -14,41 +18,4 @@ resource "google_project_service" "apis" {
   # Don't turn the API off on `terraform destroy` — other things in the
   # project might be using it.
   disable_on_destroy = false
-}
-
-# ---------------------------------------------------------------------------
-# Landing bucket
-# ---------------------------------------------------------------------------
-
-resource "google_storage_bucket" "landing" {
-  name     = var.bucket_name
-  location = var.region
-
-  # IAM only (no per-object ACLs), and never allow public access.
-  uniform_bucket_level_access = true
-  public_access_prevention    = "enforced"
-
-  # Deleted objects stay recoverable for 7 days.
-  soft_delete_policy {
-    retention_duration_seconds = 7 * 24 * 60 * 60
-  }
-
-  # Raw files are rarely read after the first month; move them to a cheaper class.
-  lifecycle_rule {
-    condition {
-      age = 30
-    }
-    action {
-      type          = "SetStorageClass"
-      storage_class = "NEARLINE"
-    }
-  }
-
-  # Lets `terraform destroy` delete the bucket even if it holds files.
-  # Fine for a portfolio project; you'd set false for real data.
-  force_destroy = true
-
-  # Terraform figures out ordering from references. This bucket doesn't
-  # reference the API resource, so we state the dependency explicitly.
-  depends_on = [google_project_service.apis]
 }
